@@ -1,20 +1,22 @@
 import logging
+import asyncio
+from telegram import Update
 from telegram.ext import (
     Application, 
     CommandHandler, 
     MessageHandler, 
     CallbackQueryHandler, 
-    ConversationHandler, 
-    filters
+    filters,
+    ContextTypes
 )
 
 # AERP Core Imports
 from core.config import Config
+from core.database.supabase_client import db
 from core.handlers import (
     start_handler, 
     shipment_handler, 
-    admin_handler, 
-    edit_handler
+    admin_handler
 )
 
 # Enable logging
@@ -23,92 +25,136 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- STATE DEFINITIONS ---
-(
-    NAMING, COMPANY, 
-    AIRLINE, AWB, SPECS, DIMS, RATES, ADDRESSES, 
-    CONFIRM, EDIT_FIELD, UPLOAD_PROOF, 
-    SET_RATE, REJECT_REASON
-) = range(13)
+async def master_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    THE CENTRAL BRAIN (Master Message Router)
+    Routes all text/media based on the user state stored in Supabase.
+    Priority Logic: Dashboard buttons always override any state.
+    """
+    if not update.message: return
+    
+    user_id = update.effective_user.id
+    text = update.message.text if update.message.text else ""
+    user = db.get_user(user_id)
+
+    # 1. Handle Unregistered Users
+    if not user:
+        if text == "/start":
+            await start_handler.start(update, context)
+        else:
+            await start_handler.handle_registration_name(update, context)
+        return
+
+    # 2. GLOBAL DASHBOARD PRIORITY (Overwrites States)
+    if text == "📦 New Shipment":
+        await shipment_handler.start_new_shipment(update, context)
+        return
+    elif text == "🔍 Track My Shipments":
+        await shipment_handler.track_shipments(update, context)
+        return
+    elif text == "👤 My Profile":
+        await shipment_handler.view_profile(update, context)
+        return
+    elif text == "🛠 Staff Panel":
+        await admin_handler.open_staff_panel(update, context)
+        return
+    elif text == "👑 Admin Settings":
+        await admin_handler.open_admin_settings(update, context)
+        return
+    elif text == "🏠 Back to Menu":
+        db.update_user_state(user_id, None)
+        await start_handler.start(update, context)
+        return
+
+    # 3. STATE-BASED ROUTING (Reads from Supabase)
+    state = user.get('state')
+    if not state:
+        return
+
+    # Registration States
+    if state == "REG_NAME":
+        await start_handler.handle_registration_name(update, context)
+    elif state == "REG_COMPANY":
+        await start_handler.handle_registration_company(update, context)
+    
+    # Shipment Wizard (Airline, Origin, Dest, AWB, etc.) & Edit Engine States
+    elif state.startswith("SHIP_") or state.startswith("EDIT_INPUT_"):
+        await shipment_handler.handle_shipment_text_input(update, context, user, text)
+    
+    # Phase 2: Payment Upload States (Receives Photo or PDF)
+    elif state.startswith("UPLOAD_"):
+        await shipment_handler.handle_phase2_upload(update, context, user)
+    
+    # Admin/Staff States (Exchange Rate, Announcements, Rejection Comments)
+    elif state == "SET_EXCHANGE" or state.startswith("REJECT_") or state == "ADM_BROADCAST":
+        await admin_handler.handle_admin_msg(update, context)
+
+async def master_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    THE CENTRAL CALLBACK BRAIN
+    Routes all Inline Button clicks for the entire organization.
+    """
+    query = update.callback_query
+    data = query.data
+
+    # --- Shipment Creation & Editing Logic ---
+    # Catching: Confirmation, Edit Menu, History Selection, Navigation
+    if (data == "confirm_shipment" or 
+        data == "open_edit_menu" or 
+        data.startswith("edit_field_") or 
+        data == "back_to_summary" or
+        data.startswith("edit_hist_") or
+        data == "back_step" or
+        data == "cancel_wizard"):
+        await shipment_handler.handle_shipment_callbacks(update, context)
+    
+    # --- Admin & Staff Management Logic ---
+    # Catching: Rate/Payment Approvals, User Management, Staff Lifecycle
+    elif (data.startswith("rate_") or 
+          data.startswith("pay_") or 
+          data.startswith("usr_") or
+          data.startswith("st_upd_") or
+          data.startswith("adm_") or
+          data == "set_ex_rate" or 
+          data == "admin_settings"):
+        await admin_handler.handle_admin_callbacks(update, context)
+    
+    # --- Phase 2: User Trigger ---
+    # User clicks "Upload Payment Proof" from their chat notification
+    elif data.startswith("start_upload_"):
+        await shipment_handler.start_proof_upload(update, context)
+    
+    # --- UI & Profile Navigation ---
+    elif data == "track_shipment":
+        await shipment_handler.track_shipments(update, context)
+    elif data == "view_profile":
+        await shipment_handler.view_profile(update, context)
+    
+    # --- Universal State Reset (Back to Main) ---
+    elif data == "back_to_main":
+        user_id = update.effective_user.id
+        db.update_user_state(user_id, None)
+        await start_handler.start(update, context)
 
 def main():
-    print("🚀 Starting AERP Local Mode...")
-    print("Priority Logic: Dashboard buttons now have global precedence.")
+    print("🚀 Starting AERP Local Mode [Checkpoint ARK Final]")
+    print("Logic: Manual Route Entry and Dashboard Priority Routing Active.")
     
     # Initialize the Application
     application = Application.builder().token(Config.TELEGRAM_TOKEN).build()
 
-    # --- 1. GLOBAL HIGH-PRIORITY HANDLERS ---
-    # These are registered FIRST. They will interrupt any conversation (like shipment entry)
-    # when a dashboard button is pressed. This fixes your "Buttons don't do anything" problem.
+    # Register the Master Routers
+    # Group 0: Messages (Dashboard + Wizard text input + Proof media)
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, master_message_router), group=0)
     
-    application.add_handler(MessageHandler(filters.Text("📦 New Shipment"), shipment_handler.start_new_shipment))
-    application.add_handler(MessageHandler(filters.Text("🔍 Track My Shipments"), shipment_handler.track_shipments))
-    application.add_handler(MessageHandler(filters.Text("👤 My Profile"), shipment_handler.view_profile))
-    application.add_handler(MessageHandler(filters.Text("👑 Admin Settings"), admin_handler.open_admin_settings))
-    application.add_handler(MessageHandler(filters.Text("🛠 Staff Panel"), shipment_handler.track_shipments))
-
-    # --- 2. GLOBAL CALLBACK HANDLERS ---
-    # Handlers for the Admin Channel and universal 'Back' logic
-    application.add_handler(CallbackQueryHandler(admin_handler.handle_rate_callback, pattern="^rate_"))
-    application.add_handler(CallbackQueryHandler(admin_handler.handle_payment_callback, pattern="^pay_"))
-    application.add_handler(CallbackQueryHandler(admin_handler.handle_user_approval, pattern="^usr_"))
-    application.add_handler(CallbackQueryHandler(start_handler.start, pattern="^back_to_main$"))
-    application.add_handler(CallbackQueryHandler(shipment_handler.start_proof_upload, pattern="^start_upload_"))
+    # Group 0: Callbacks (All Inline Buttons)
+    application.add_handler(CallbackQueryHandler(master_callback_router), group=0)
     
-    # --- 3. CONVERSATION HANDLER ---
-    # Handles specific step-by-step logic
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start_handler.start),
-            CallbackQueryHandler(shipment_handler.start_new_shipment, pattern="^new_shipment$"),
-            CallbackQueryHandler(shipment_handler.view_profile, pattern="^view_profile$"),
-            CallbackQueryHandler(shipment_handler.track_shipments, pattern="^track_shipment$"),
-        ],
-        states={
-            # Phase 0: Registration
-            NAMING: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_handler.handle_registration_name)],
-            COMPANY: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_handler.handle_registration_company)],
-            
-            # Phase 1: Creation
-            AIRLINE: [CallbackQueryHandler(shipment_handler.handle_airline, pattern="^air_")],
-            AWB: [MessageHandler(filters.TEXT & ~filters.COMMAND, shipment_handler.handle_awb)],
-            SPECS: [MessageHandler(filters.TEXT & ~filters.COMMAND, shipment_handler.handle_specs)],
-            DIMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, shipment_handler.handle_dims)],
-            RATES: [MessageHandler(filters.TEXT & ~filters.COMMAND, shipment_handler.handle_rates)],
-            ADDRESSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, shipment_handler.handle_addresses)],
-            
-            CONFIRM: [
-                CallbackQueryHandler(shipment_handler.handle_confirm_and_request_review, pattern="^confirm_shipment$"),
-                CallbackQueryHandler(shipment_handler.open_edit_menu_handler, pattern="^open_edit_menu$"),
-                CallbackQueryHandler(shipment_handler.handle_addresses, pattern="^back_to_summary$")
-            ],
-            
-            EDIT_FIELD: [
-                CallbackQueryHandler(edit_handler.process_edit_selection, pattern="^edit_field_"),
-                CallbackQueryHandler(shipment_handler.handle_airline, pattern="^air_"),
-                CallbackQueryHandler(shipment_handler.handle_addresses, pattern="^back_to_summary$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_handler.save_edit_input)
-            ],
-            
-            # Phase 2: Upload
-            UPLOAD_PROOF: [
-                MessageHandler(filters.PHOTO | filters.Document.ALL, shipment_handler.handle_file_upload)
-            ],
-            
-            REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handler.save_rejection_reason)],
-        },
-        fallbacks=[
-            CommandHandler("start", start_handler.start),
-            CallbackQueryHandler(start_handler.start, pattern="^cancel_action$")
-        ],
-        allow_reentry=True
-    )
+    # Group 0: Command /start
+    application.add_handler(CommandHandler("start", start_handler.start))
 
-    application.add_handler(conv_handler)
-
-    # Start the Bot
-    print("✅ AERP Live. Dashboard priority active. No bolding enabled.")
+    # Deployment Note: This Master Router is 100% compatible with the api/index.py webhook
+    print("✅ AERP Live. User editing and manual airline entry are now responsive.")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
