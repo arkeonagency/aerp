@@ -25,30 +25,35 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Initialize FastAPI app
+# Initialize FastAPI
 app = FastAPI()
 
-# Global Application instance for the bot
-# In Vercel, we initialize it once to benefit from warm starts
+# Global Application instance for Vercel warm starts
 ptb_application = Application.builder().token(Config.TELEGRAM_TOKEN).build()
 
-# --- MASTER ROUTERS (EXACTLY AS PER RUN_LOCAL.PY) ---
+# --- THE PRODUCTION MASTER ROUTER ---
 
-async def master_message_router(update: Update, context):
+async def production_message_router(update: Update, context):
+    """
+    THE CENTRAL BRAIN
+    Routes all text/media based on database state to fix Vercel loops.
+    """
     if not update.message: return
     
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     user = db.get_user(user_id)
 
+    # 1. Handle New/Unregistered Users
     if not user:
         if text == "/start":
             await start_handler.start(update, context)
         else:
-            await start_handler.handle_registration_name(update, context)
+            # First time arrival, treat as start
+            await start_handler.start(update, context)
         return
 
-    # GLOBAL DASHBOARD PRIORITY
+    # 2. GLOBAL DASHBOARD PRIORITY (Overwrites all states)
     if text == "📦 New Shipment":
         await shipment_handler.start_new_shipment(update, context)
         return
@@ -69,24 +74,34 @@ async def master_message_router(update: Update, context):
         await start_handler.start(update, context)
         return
 
+    # 3. STATE-BASED ROUTING (The Loop Fix)
     state = user.get('state')
     if not state: return
 
+    # Registration Steps
     if state == "REG_NAME":
         await start_handler.handle_registration_name(update, context)
     elif state == "REG_COMPANY":
         await start_handler.handle_registration_company(update, context)
+    
+    # Shipment Creation & Edit Steps
     elif state.startswith("SHIP_") or state.startswith("EDIT_INPUT_"):
         await shipment_handler.handle_shipment_text_input(update, context, user, text)
+    
+    # Payment Upload Steps
     elif state.startswith("UPLOAD_"):
         await shipment_handler.handle_phase2_upload(update, context, user)
+    
+    # Admin/Staff States
     elif state == "SET_EXCHANGE" or state.startswith("REJECT_") or state == "ADM_BROADCAST":
         await admin_handler.handle_admin_msg(update, context)
 
-async def master_callback_router(update: Update, context):
+async def production_callback_router(update: Update, context):
+    """Routes all inline button clicks."""
     query = update.callback_query
     data = query.data
 
+    # Shipment Logic
     if (data == "confirm_shipment" or 
         data == "open_edit_menu" or 
         data.startswith("edit_field_") or 
@@ -95,6 +110,8 @@ async def master_callback_router(update: Update, context):
         data == "back_step" or
         data == "cancel_wizard"):
         await shipment_handler.handle_shipment_callbacks(update, context)
+    
+    # Admin/Staff Logic
     elif (data.startswith("rate_") or 
           data.startswith("pay_") or 
           data.startswith("usr_") or
@@ -103,6 +120,8 @@ async def master_callback_router(update: Update, context):
           data == "set_ex_rate" or 
           data == "admin_settings"):
         await admin_handler.handle_admin_callbacks(update, context)
+    
+    # UI Logic
     elif data.startswith("start_upload_"):
         await shipment_handler.start_proof_upload(update, context)
     elif data == "track_shipment":
@@ -114,31 +133,32 @@ async def master_callback_router(update: Update, context):
         db.update_user_state(user_id, None)
         await start_handler.start(update, context)
 
-# --- VERCEL WEBHOOK INITIALIZATION ---
+# --- VERCEL SERVER CONFIGURATION ---
 
-# Register handlers to the application instance
+# Bind routers to the PTB Application
 ptb_application.add_handler(CommandHandler("start", start_handler.start))
-ptb_application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, master_message_router))
-ptb_application.add_handler(CallbackQueryHandler(master_callback_router))
+ptb_application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, production_message_router))
+ptb_application.add_handler(CallbackQueryHandler(production_callback_router))
 
 @app.post("/api/index")
 async def webhook_handler(request: Request):
     """
-    The entry point for Vercel. Telegram sends a POST request here.
+    Main Webhook Entry Point.
+    Telegram sends updates here as JSON.
     """
-    if ptb_application.running:
+    try:
         data = await request.json()
         update = Update.de_json(data, ptb_application.bot)
+        
+        if not ptb_application.running:
+            await ptb_application.initialize()
+            
         await ptb_application.process_update(update)
-    else:
-        # Initialize the bot if it's the first cold start
-        await ptb_application.initialize()
-        data = await request.json()
-        update = Update.de_json(data, ptb_application.bot)
-        await ptb_application.process_update(update)
-    
-    return {"status": "ok"}
+        return {"status": "ok"}
+    except Exception as e:
+        logging.error(f"Webhook Error: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.get("/")
-async def root_handler():
-    return {"message": "AERP Enterprise Bot is Live on Vercel"}
+async def root():
+    return {"message": "AERP Enterprise Production Server is Live"}
