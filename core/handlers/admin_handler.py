@@ -22,8 +22,8 @@ async def open_admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     user = db.get_user(user_id)
     
-    # Permission check
-    if user['role'] not in ['admin', 'staff']:
+    # Permission check for Admin/Staff only
+    if not user or user['role'] not in ['admin', 'staff']:
         return
 
     rate = db.get_setting('exchange_rate')
@@ -52,7 +52,7 @@ async def handle_admin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user = db.get_user(user_id)
     
-    if user['role'] not in ['admin', 'staff']:
+    if not user or user['role'] not in ['admin', 'staff']:
         return
 
     # --- STATE HANDLING: EXCHANGE RATE ---
@@ -106,6 +106,11 @@ async def process_admin_rejection(update: Update, context: ContextTypes.DEFAULT_
     shipment_id = state_parts[2]
     shipment = db.get_shipment(shipment_id)
     
+    if not shipment:
+        await update.message.reply_text("❌ Error: Shipment not found.")
+        db.update_user_state(user['telegram_id'], None)
+        return
+
     if reject_type == "RATE":
         title = "❌ Shipment Rate Rejected"
         new_status = "quotation_created"
@@ -115,7 +120,7 @@ async def process_admin_rejection(update: Update, context: ContextTypes.DEFAULT_
         new_status = "rate_approved"
         db.update_shipment_status(shipment_id, new_status, "unpaid")
 
-    # Notify User with the appropriate Re-submit/Edit buttons!
+    # Notify User with the appropriate Re-submit/Edit buttons
     await context.bot.send_message(
         chat_id=shipment['created_by'], 
         text=f"{title}\nAWB: {shipment['awb_number']}\n\nComment from Staff:\n{text}\n\nPlease fix the issue and resubmit.",
@@ -134,6 +139,7 @@ async def open_staff_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lists recent shipments for manual lifecycle management."""
     query = update.callback_query
     user_id = update.effective_user.id
+    user = db.get_user(user_id)
     
     if query: await query.answer()
     
@@ -168,6 +174,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     data = query.data
     user_id = update.effective_user.id
+    user = db.get_user(user_id)
     await query.answer()
 
     parts = data.split("_")
@@ -244,9 +251,9 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         db.update_user_state(user_id, f"REJECT_PAYMENT_{ship_id}")
         await query.message.reply_text("📝 Please type the reason for Payment Rejection:")
 
-    # 3. STAFF LIFECYCLE MANAGEMENT (BOOKED -> UPLIFTED -> COMPLETED)
+    # 3. STAFF LIFECYCLE MANAGEMENT
     elif data.startswith("st_upd_"):
-        new_status = parts[2] # booked, uplifted, completed
+        new_status = parts[2]
         db.update_shipment_status(ship_id, new_status)
         await query.edit_message_text(f"{query.message.text}\n\n✅ Lifecycle status updated to {new_status.upper()}")
         
@@ -256,10 +263,10 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             text=f"📦 STATUS UPDATE\nAWB: {shipment['awb_number']} is now {new_status.upper()}."
         )
 
-    # 4. USER ACCESS MANAGEMENT (APPROVE / BLOCK)
+    # 4. USER ACCESS MANAGEMENT (Multi-Admin / Multi-Staff Support)
     elif data.startswith("usr_apprv_"):
         tid = int(parts[2])
-        role = parts[3]
+        role = parts[3] # admin, staff, or user
         db.approve_user(tid, role)
         await query.edit_message_text(f"✅ Approved User ID {tid} as {role.upper()}")
         await context.bot.send_message(
